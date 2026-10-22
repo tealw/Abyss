@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://ddp2wq7024ql2"
-path="res://.godot/imported/oceangradient.png-33f00b3892d9ec52ee8fed58296cff06.ctex"
+uid="uid://d0jjk2lkx7gtc"
+path="res://.godot/imported/oceangradient.png-2eeb5fe11016589a89812d4bac2d523b.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://art/font and other stuff/oceangradient.png"
-dest_files=["res://.godot/imported/oceangradient.png-33f00b3892d9ec52ee8fed58296cff06.ctex"]
+source_file="res://color/oceangradient.png"
+dest_files=["res://.godot/imported/oceangradient.png-2eeb5fe11016589a89812d4bac2d523b.ctex"]
 
 [params]
 
