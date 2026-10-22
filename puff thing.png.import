@@ -3,15 +3,15 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://c8h7r3f808r6m"
-path="res://.godot/imported/puff thing.png-e7720cadf92eee85a1ae360d7323e6b7.ctex"
+path="res://.godot/imported/puff thing.png-ff687b595e899c3d119ee0789cf38bdd.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://art/fx/puff thing.png"
-dest_files=["res://.godot/imported/puff thing.png-e7720cadf92eee85a1ae360d7323e6b7.ctex"]
+source_file="res://puff thing.png"
+dest_files=["res://.godot/imported/puff thing.png-ff687b595e899c3d119ee0789cf38bdd.ctex"]
 
 [params]
 
