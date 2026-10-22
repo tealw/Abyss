@@ -1,0 +1,1520 @@
+extends Node
+## ABYSS - 2D pixelated underwater horror prototype (Godot 4.x, GDScript)
+##
+## SETUP: new scene -> root node = plain "Node" -> attach this script -> save scene -> set it
+## as the main scene -> run. Everything (graphics, lights, shader, audio) is generated in code.
+## Controls: tap / hold / dra g anywhere to move. PHOTO button = take a picture.
+
+# ---------------------------------------------------------------- config
+const BASE_H := 180.0            # internal pixel resolution height (lower = chunkier pixels)
+const SEABED_Y := 3200.0
+const HALF_W := 1300.0
+const PHOTOS_NEEDED := 3
+const SUB_MAX_SPEED := 85.0
+const SUB_ACCEL := 70.0
+const MIX_RATE := 22050.0
+
+enum S { SHIP, BOARDING, INTERIOR, DESCENDING, DIVING, ESCAPE, DEAD, WON }
+var state: int = S.SHIP
+
+# ---------------------------------------------------------------- nodes / state
+var time := 0.0
+var sub_vp: SubViewport
+var display: TextureRect
+var fx: ShaderMaterial
+var world: Node2D
+var cam: Camera2D
+var canvas_mod: CanvasModulate
+var ship: Ship
+var hero: Hero
+var sub: Sub
+var creature: Creature
+var interior: Interior
+var interior_layer: CanvasLayer
+var fish_schools: Array[FishSchool] = []
+var deep_creatures: Array[Creature] = []
+var view_inside := false
+var view_toggle: Button
+var depth_scare_started := false
+var implosion_t := 0.0
+var depth_blackout := 0.0
+var eyes: Eyes
+var marker: Marker
+var beam: PointLight2D
+var glow: PointLight2D
+var snow: CPUParticles2D
+var foot_silt: CPUParticles2D
+var sub_bubbles: CPUParticles2D
+var sub_wake: CPUParticles2D
+var ambient_bubbles: CPUParticles2D
+var glow_layer: CanvasLayer
+var status: Label
+var hint: Label
+var sonar: Label
+var center_lbl: Label
+var photo_btn: Button
+var flash: ColorRect
+
+var target := Vector2.ZERO
+var has_target := false
+var hero_vx := 0.0
+var descend_speed := 0.0
+var photos := 0
+var photo_cd := 0.0
+var fear := 0.0
+var fear_spike := 0.0
+var shake_spike := 0.0
+var flash_a := 0.0
+var flash_col := Color.WHITE
+var dead_t := 0.0
+var sonar_t := 0.0
+var hint_t := 0.0
+var k_depth := 0.0
+var prev_mode := 0
+
+# audio state
+var gen_playback: AudioStreamGeneratorPlayback
+var ph1 := 0.0
+var ph2 := 0.0
+var ph3 := 0.0
+var ph_lfo := 0.0
+var ph_e := 0.0
+var ph_wave := 0.0
+var lp := 0.0
+var wash_lp := 0.0
+var heart_t := 0.0
+var event_t := 5.0
+var event_age := -1.0
+var event_len := 3.0
+var event_kind := 0
+var scare_env := 0.0
+var click_env := 0.0
+
+
+# ================================================================ INNER CLASSES (drawing)
+
+class Backdrop extends Node2D:
+	func _draw() -> void:
+		var W := 4000.0
+		var sky_top := Color(0.04, 0.05, 0.08)
+		var sky_low := Color(0.38, 0.45, 0.46)
+		draw_polygon(PackedVector2Array([Vector2(-W, -900), Vector2(W, -900), Vector2(W, 0), Vector2(-W, 0)]),
+			PackedColorArray([sky_top, sky_top, sky_low, sky_low]))
+		draw_circle(Vector2(-240, -190), 30.0, Color(0.55, 0.6, 0.58, 0.25))
+		draw_circle(Vector2(-240, -190), 20.0, Color(0.88, 0.92, 0.86))
+		var a := Color(0.12, 0.36, 0.40)
+		var b := Color(0.02, 0.08, 0.14)
+		var c := Color(0.0, 0.0, 0.02)
+		draw_polygon(PackedVector2Array([Vector2(-W, 0), Vector2(W, 0), Vector2(W, 700), Vector2(-W, 700)]),
+			PackedColorArray([a, a, b, b]))
+		draw_polygon(PackedVector2Array([Vector2(-W, 700), Vector2(W, 700), Vector2(W, 3400), Vector2(-W, 3400)]),
+			PackedColorArray([b, b, c, c]))
+
+
+class Waves extends Node2D:
+	var t := 0.0
+	func _process(d: float) -> void:
+		t += d
+		queue_redraw()
+	func _draw() -> void:
+		var pts := PackedVector2Array()
+		for i in range(-70, 71):
+			var x := i * 12.0
+			pts.append(Vector2(x, sin(x * 0.05 + t * 1.5) * 1.6 + sin(x * 0.13 - t) * 0.8))
+		draw_rect(Rect2(-840, 0, 1680, 14), Color(0.10, 0.30, 0.34, 0.5))
+		draw_polyline(pts, Color(0.7, 0.85, 0.85), 1.0)
+
+
+class Terrain extends Node2D:
+	var seabed_y := 3200.0
+	var half_w := 1300.0
+	func _draw() -> void:
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 1313
+		var rock := Color(0.13, 0.15, 0.17)
+		var bone := Color(0.75, 0.74, 0.66)
+		# sea floor
+		var pts := PackedVector2Array()
+		var x := -half_w - 300.0
+		while x <= half_w + 300.0:
+			pts.append(Vector2(x, seabed_y + rng.randf_range(-25.0, 25.0)))
+			x += rng.randf_range(20.0, 50.0)
+		pts.append(Vector2(half_w + 300.0, seabed_y + 400.0))
+		pts.append(Vector2(-half_w - 300.0, seabed_y + 400.0))
+		draw_colored_polygon(pts, rock)
+		# cliff walls
+		for side in [-1.0, 1.0]:
+			var w := PackedVector2Array()
+			var y := 40.0
+			while y <= seabed_y:
+				w.append(Vector2(side * (half_w + rng.randf_range(-30.0, 40.0)), y))
+				y += rng.randf_range(30.0, 90.0)
+			w.append(Vector2(side * (half_w + 400.0), seabed_y))
+			w.append(Vector2(side * (half_w + 400.0), 40.0))
+			draw_colored_polygon(w, rock)
+		# rock spikes on the floor
+		for i in 30:
+			var bx := rng.randf_range(-half_w, half_w)
+			var h := rng.randf_range(15.0, 60.0)
+			draw_colored_polygon(PackedVector2Array([Vector2(bx - 12, seabed_y + 5), Vector2(bx + rng.randf_range(-6, 6), seabed_y - h), Vector2(bx + 12, seabed_y + 5)]), rock.lightened(0.05))
+		# rotting wreck
+		draw_set_transform(Vector2(-650, 1700), 0.45, Vector2.ONE)
+		draw_colored_polygon(PackedVector2Array([Vector2(-120, -20), Vector2(100, -20), Vector2(140, -40), Vector2(100, 20), Vector2(-110, 20)]), Color(0.22, 0.14, 0.12))
+		for i in 5:
+			draw_circle(Vector2(-80 + i * 38, -2), 5.0, Color(0, 0, 0))
+		draw_line(Vector2(-60, -20), Vector2(-60, -70), Color(0.2, 0.13, 0.1), 3.0)
+		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		# giant ribcage = landmark near the creature's lair
+		var rp := Vector2(450, seabed_y - 4)
+		draw_line(rp + Vector2(-20, -2), rp + Vector2(270, -2), bone, 5.0)
+		for i in 9:
+			var cx := rp.x + i * 30.0
+			var r := 85.0 - absf(float(i) - 4.0) * 9.0
+			draw_arc(Vector2(cx, rp.y), r, PI, TAU, 14, bone, 3.0)
+
+
+class Hero extends Node2D:
+	var walking := false
+	var facing := 1.0
+	var t := 0.0
+	func _process(d: float) -> void:
+		t += d
+		queue_redraw()
+	func _draw() -> void:
+		var bob := absf(sin(t * 10.0)) * 0.8 if walking else 0.0
+		draw_set_transform(Vector2(0, -bob), 0.0, Vector2(facing, 1.0))
+		draw_rect(Rect2(-1.5, -4, 1.4, 4), Color(0.15, 0.15, 0.2))
+		draw_rect(Rect2(0.2, -4, 1.4, 4), Color(0.15, 0.15, 0.2))
+		draw_rect(Rect2(-2.5, -10, 5, 6), Color(0.9, 0.72, 0.1))      # raincoat
+		draw_rect(Rect2(-2, -14, 4, 4), Color(0.82, 0.66, 0.52))      # head
+		draw_rect(Rect2(-3, -15, 6, 2), Color(0.9, 0.72, 0.1))        # hood
+		draw_rect(Rect2(2, -9, 4, 3), Color(0.08, 0.08, 0.08))        # camera
+		draw_circle(Vector2(5, -7.5), 1.0, Color(0.5, 0.7, 0.8))
+
+
+class Ship extends Node2D:
+	var t := 0.0
+	var cable_on := false
+	var cable_to := Vector2.ZERO
+	func _process(d: float) -> void:
+		t += d
+		position.y = sin(t * 0.9) * 1.2
+		rotation = sin(t * 0.7) * 0.012
+		queue_redraw()
+	func _draw() -> void:
+		# Weather-beaten research vessel: deep keel, plated hull, exposed deck machinery.
+		var hull := PackedVector2Array([Vector2(-145, -18), Vector2(126, -18), Vector2(157, -31), Vector2(137, -5), Vector2(112, 13), Vector2(-119, 13), Vector2(-145, -2)])
+		draw_colored_polygon(hull, Color(0.12, 0.16, 0.18))
+		draw_colored_polygon(PackedVector2Array([Vector2(-145, -18), Vector2(126, -18), Vector2(151, -28), Vector2(130, -17), Vector2(-141, -14)]), Color(0.36, 0.39, 0.37))
+		draw_line(Vector2(-119, 7), Vector2(112, 7), Color(0.46, 0.08, 0.07), 3.0)
+		# Weld seams and rusty hull plates
+		for i in 9:
+			var x := -112.0 + float(i) * 27.0
+			draw_line(Vector2(x, -12), Vector2(x + 2, 4), Color(0.24, 0.27, 0.27), 1.0)
+			draw_circle(Vector2(x, -8), 1.2, Color(0.55, 0.42, 0.30))
+		# Raised deck and cramped bridge
+		draw_colored_polygon(PackedVector2Array([Vector2(-91, -21), Vector2(32, -21), Vector2(24, -55), Vector2(-72, -55)]), Color(0.25, 0.29, 0.29))
+		draw_rect(Rect2(-77, -51, 89, 5), Color(0.43, 0.46, 0.43))
+		draw_rect(Rect2(-69, -47, 77, 19), Color(0.18, 0.23, 0.24))
+		for i in 5:
+			var wx := -63.0 + float(i) * 14.0
+			draw_rect(Rect2(wx, -43, 8, 9), Color(0.65, 0.42, 0.20, 0.85))
+			draw_line(Vector2(wx + 4, -43), Vector2(wx + 4, -34), Color(0.09, 0.12, 0.13), 1.0)
+		# Exhaust stack, pipes and radar mast
+		draw_rect(Rect2(-48, -76, 15, 24), Color(0.16, 0.19, 0.20))
+		draw_rect(Rect2(-51, -78, 21, 4), Color(0.43, 0.28, 0.19))
+		draw_rect(Rect2(-19, -70, 3, 17), Color(0.31, 0.34, 0.33))
+		draw_line(Vector2(-14, -55), Vector2(-14, -98), Color(0.24, 0.28, 0.29), 2.0)
+		draw_line(Vector2(-27, -90), Vector2(-2, -90), Color(0.24, 0.28, 0.29), 1.0)
+		draw_arc(Vector2(-14, -96), 7.0, 0.0, TAU, 12, Color(0.32, 0.36, 0.36), 1.0)
+		if fmod(t, 2.0) < 1.0:
+			draw_circle(Vector2(-14, -103), 2.0, Color(0.95, 0.06, 0.04))
+		# Railings, deck lamps and winch
+		draw_line(Vector2(-136, -25), Vector2(120, -25), Color(0.38, 0.42, 0.42), 1.2)
+		for i in 15:
+			var x := -134.0 + float(i) * 18.0
+			draw_line(Vector2(x, -18), Vector2(x, -25), Color(0.38, 0.42, 0.42), 1.0)
+		draw_rect(Rect2(75, -35, 24, 15), Color(0.18, 0.21, 0.22))
+		draw_circle(Vector2(86, -38), 3.0, Color(0.9, 0.19, 0.08, 0.8 + 0.2 * sin(t * 4.0)))
+		draw_line(Vector2(-119, -18), Vector2(-119, -75), Color(0.16, 0.19, 0.20), 3.0)
+		draw_line(Vector2(-119, -75), Vector2(-167, -67), Color(0.16, 0.19, 0.20), 3.0)
+		draw_circle(Vector2(-119, -18), 5.0, Color(0.35, 0.37, 0.36))
+		if cable_on:
+			draw_line(Vector2(-167, -67), cable_to, Color(0.08, 0.09, 0.10), 2.0)
+		# Ominous name stencil and a few dark portholes.
+		for i in 3:
+			draw_circle(Vector2(35 + i * 13, -3), 2.2, Color(0.025, 0.035, 0.04))
+		draw_line(Vector2(-95, 11), Vector2(-42, 11), Color(0.44, 0.41, 0.34), 1.0)
+		draw_string(ThemeDB.fallback_font, Vector2(22, 4), "SUB MAX: 2000m", HORIZONTAL_ALIGNMENT_LEFT, -1, 6, Color(0.82, 0.70, 0.46))
+
+
+class Sub extends Node2D:
+	var vel := Vector2.ZERO
+	var facing := 1.0       # smoothed, for the turning animation
+	var face_dir := 1.0     # -1 / +1
+	var tilt := 0.0
+	var t := 0.0
+	var implosion_factor := 0.0
+	func _process(d: float) -> void:
+		t += d
+		queue_redraw()
+	func _ellipse(rx: float, ry: float, n: int) -> PackedVector2Array:
+		var p := PackedVector2Array()
+		for i in n:
+			var a := TAU * float(i) / float(n)
+			p.append(Vector2(cos(a) * rx, sin(a) * ry))
+		return p
+	func _draw() -> void:
+		var crush := clampf(implosion_factor, 0.0, 1.0)
+		var sx := 1.0 - crush * 0.66
+		var sy := 1.0 - crush * 0.82
+		draw_set_transform(Vector2(0, sin(t * 1.7) * 0.8), tilt, Vector2(facing * sx, sy))
+		# Compact deep-sea pressure capsule, not a toy: layered steel hull and armored nose.
+		draw_colored_polygon(_ellipse(24.0, 10.0, 24), Color(0.12, 0.16, 0.18))
+		draw_colored_polygon(_ellipse(20.0, 8.0, 24), Color(0.34, 0.39, 0.37))
+		draw_colored_polygon(PackedVector2Array([Vector2(9, -7), Vector2(22, -3), Vector2(25, 0), Vector2(22, 4), Vector2(9, 7)]), Color(0.17, 0.21, 0.22))
+		# Reinforced bands, welds and pressure bolts.
+		for x in [-13.0, -4.0, 5.0, 14.0]:
+			draw_line(Vector2(x, -7.0), Vector2(x, 7.0), Color(0.10, 0.12, 0.13), 1.5)
+		for x in [-17.0, -9.0, -1.0, 7.0, 15.0]:
+			draw_circle(Vector2(x, -7.0), 1.0, Color(0.65, 0.62, 0.50))
+			draw_circle(Vector2(x, 7.0), 1.0, Color(0.65, 0.62, 0.50))
+		# Observation ports, armored nose glass and serial stencil.
+		for x in [-8.0, 0.0, 8.0]:
+			draw_circle(Vector2(x, -1.0), 2.5, Color(0.025, 0.06, 0.07))
+			draw_circle(Vector2(x, -1.0), 1.3, Color(0.22, 0.47, 0.48))
+		draw_circle(Vector2(18, 0), 4.5, Color(0.045, 0.075, 0.08))
+		draw_circle(Vector2(18, 0), 3.0, Color(0.45, 0.74, 0.72))
+		draw_circle(Vector2(18, 0), 1.2, Color(0.85, 1.0, 0.95))
+		# Skids, ballast tanks, rear thruster and directional fins.
+		draw_line(Vector2(-18, 8), Vector2(17, 8), Color(0.08, 0.10, 0.11), 2.0)
+		draw_line(Vector2(-11, 8), Vector2(-15, 12), Color(0.22, 0.25, 0.25), 2.0)
+		draw_line(Vector2(11, 8), Vector2(15, 12), Color(0.22, 0.25, 0.25), 2.0)
+		draw_colored_polygon(PackedVector2Array([Vector2(-17, -4), Vector2(-25, -8), Vector2(-23, 1), Vector2(-15, 3)]), Color(0.16, 0.19, 0.20))
+		draw_colored_polygon(PackedVector2Array([Vector2(-17, 4), Vector2(-25, 8), Vector2(-23, -1), Vector2(-15, -3)]), Color(0.16, 0.19, 0.20))
+		var pr := sin(t * 25.0) * 5.0
+		draw_line(Vector2(-25, -pr), Vector2(-25, pr), Color(0.55, 0.59, 0.57), 2.0)
+		# Red pressure warning stripe and a cracked panel as the hull begins to buckle.
+		draw_line(Vector2(-14, 9), Vector2(13, 9), Color(0.52, 0.07, 0.045, 0.9), 2.0)
+		if crush > 0.25:
+			draw_line(Vector2(-6, -5), Vector2(0, 0), Color(0.03, 0.025, 0.025), 2.0 + crush * 2.0)
+			draw_line(Vector2(0, 0), Vector2(5, -4), Color(0.03, 0.025, 0.025), 2.0 + crush * 2.0)
+			draw_line(Vector2(0, 0), Vector2(4, 5), Color(0.03, 0.025, 0.025), 1.5 + crush * 2.0)
+
+
+class Creature extends Node2D:
+	enum M { LURK, STALK, CHARGE, FLEE }
+	var mode: int = M.LURK
+	var vel := Vector2.ZERO
+	var heading := 0.0
+	var trail: Array[Vector2] = []
+	var home := Vector2(420.0, 760.0)
+	var target_pos := Vector2.ZERO
+	var aggression := 0.0
+	var escape := false
+	var caught := false
+	var frozen := false
+	var mode_t := 0.0
+	var charge_cd := 6.0
+	var wander := Vector2.ZERO
+	var wander_t := 0.0
+	var t := 0.0
+	var body_col := Color(0.55, 0.6, 0.64)
+	var apex := false
+
+	func _ready() -> void:
+		wander = home
+		for i in 18:
+			trail.append(position - Vector2(10.0 * (i + 1), 0.0))
+
+	func set_mode(m: int) -> void:
+		mode = m
+		mode_t = 0.0
+
+	func flee() -> void:
+		set_mode(M.FLEE)
+		aggression = minf(aggression + 0.3, 1.0)
+
+	func _process(d: float) -> void:
+		t += d
+		mode_t += d
+		queue_redraw()
+		if frozen:
+			return
+		var to_sub := target_pos - position
+		var dist := to_sub.length()
+		var dir := to_sub / maxf(dist, 0.001)
+		var desired := Vector2.ZERO
+		var accel := 60.0
+		match mode:
+			M.LURK:
+				wander_t -= d
+				if wander_t <= 0.0:
+					wander_t = randf_range(3.0, 6.0)
+					wander = home + Vector2(randf_range(-260.0, 260.0), randf_range(-160.0, 120.0))
+				desired = (wander - position).limit_length(30.0)
+				if dist < 430.0:
+					set_mode(M.STALK)
+					charge_cd = randf_range(5.0, 9.0)
+			M.STALK:
+				if escape:
+					desired = dir * 74.0
+					accel = 90.0
+				else:
+					var ring := lerpf(170.0, 85.0, aggression)
+					var spd := 1.0 + aggression * 0.6
+					desired = (dir * clampf((dist - ring) * 0.6, -35.0, 55.0) + Vector2(-dir.y, dir.x) * 24.0 * sin(t * 0.7)) * spd
+					charge_cd -= d
+					if charge_cd <= 0.0 and dist < 330.0:
+						set_mode(M.CHARGE)
+					elif dist > 800.0:
+						set_mode(M.LURK)
+			M.CHARGE:
+				desired = dir * 125.0
+				accel = 280.0
+				if mode_t > 1.4:
+					set_mode(M.STALK)
+					charge_cd = maxf(randf_range(5.0, 9.0) - aggression * 3.0, 2.5)
+			M.FLEE:
+				desired = (-dir + Vector2(0.0, 0.5)).normalized() * 140.0
+				accel = 300.0
+				if mode_t > 2.8:
+					set_mode(M.STALK)
+					charge_cd = 6.0
+		vel = vel.move_toward(desired, accel * d)
+		position += vel * d
+		position.x = clampf(position.x, -1280.0, 1280.0)
+		position.y = clampf(position.y, 120.0, 3170.0)
+		if vel.length() > 4.0:
+			heading = lerp_angle(heading, vel.angle(), 3.0 * d)
+		if dist < 22.0 and (mode == M.CHARGE or escape):
+			caught = true
+		# body follows the head
+		var prev := position
+		for i in trail.size():
+			var p := trail[i]
+			var dv := p - prev
+			var l := dv.length()
+			if l > 9.0:
+				p = prev + dv / l * 9.0
+			trail[i] = p
+			prev = p
+
+	func _draw() -> void:
+		var n := trail.size()
+		var prev := Vector2.ZERO
+		for i in n:
+			var p := to_local(trail[i])
+			var seg := p - prev
+			var nrm := Vector2(-seg.y, seg.x).normalized()
+			var q := p + nrm * sin(t * 3.0 - float(i) * 0.7) * 3.0
+			var w := lerpf(15.0, 1.5, float(i) / float(n))
+			draw_line(prev, q, body_col, w)
+			draw_circle(q, w * 0.5, body_col)
+			if i % 3 == 1:
+				draw_line(q, q + nrm * (w * 0.5 + 5.0), body_col.darkened(0.3), 1.0)
+			prev = q
+		# head (drawn along the heading, mirrored when facing left)
+		var flip := -1.0 if cos(heading) < 0.0 else 1.0
+		draw_set_transform(Vector2.ZERO, heading, Vector2(1.0, flip))
+		var g := 2.0 + (7.0 if mode == M.CHARGE else 0.0) + sin(t * 4.0) * 0.8
+		draw_colored_polygon(PackedVector2Array([Vector2(-12, 0), Vector2(26, -g * 0.5), Vector2(26, g * 0.5)]), Color(0.02, 0.0, 0.03))
+		draw_colored_polygon(PackedVector2Array([Vector2(-12, -10), Vector2(8, -12), Vector2(26, -g * 0.5 - 1.5), Vector2(26, -g * 0.5), Vector2(-12, 0)]), body_col)
+		draw_colored_polygon(PackedVector2Array([Vector2(-12, 0), Vector2(26, g * 0.5), Vector2(26, g * 0.5 + 2.0), Vector2(8, 12), Vector2(-12, 10)]), body_col)
+		for i in 6:
+			var x := 8.0 + i * 3.0
+			var edge := g * 0.5 * (x + 12.0) / 38.0
+			draw_colored_polygon(PackedVector2Array([Vector2(x, -edge), Vector2(x + 2.0, -edge), Vector2(x + 1.0, -edge + 3.0)]), Color(0.9, 0.9, 0.8))
+			draw_colored_polygon(PackedVector2Array([Vector2(x, edge), Vector2(x + 2.0, edge), Vector2(x + 1.0, edge - 3.0)]), Color(0.9, 0.9, 0.8))
+		# Lure stalk. The apex has a crown of long spines and glowing bioluminescent scars.
+		draw_line(Vector2(8, -11), Vector2(34.0 + sin(t * 2.0) * 2.0, -16.0 + cos(t * 1.7) * 2.0), body_col.darkened(0.4), 1.0)
+		if apex:
+			for i in 5:
+				var x := -8.0 + float(i) * 5.0
+				draw_line(Vector2(x, -8.0), Vector2(x - 4.0, -17.0 - float(i % 2) * 5.0), Color(0.10, 0.14, 0.16), 2.0)
+				draw_circle(Vector2(x - 4.0, -17.0 - float(i % 2) * 5.0), 1.4, Color(0.88, 0.18, 0.08))
+			for i in 4:
+				draw_line(Vector2(-3.0 + float(i) * 4.0, 6.0), Vector2(-1.0 + float(i) * 4.0, 10.0), Color(0.36, 0.82, 0.73, 0.85), 1.0)
+
+
+
+class FishSchool extends Node2D:
+	var t := 0.0
+	var swim_speed := 18.0
+	var fish_count := 9
+	var spread := 55.0
+	var fish_color := Color(0.35, 0.72, 0.76, 0.9)
+	func _process(d: float) -> void:
+		t += d
+		position.x += sin(t * 0.7) * swim_speed * d
+		position.y += cos(t * 0.5) * 2.0 * d
+		queue_redraw()
+	func _draw() -> void:
+		for i in fish_count:
+			var phase := t * 1.7 + float(i) * 1.3
+			var p := Vector2(sin(phase) * spread + float(i - fish_count / 2) * 4.0,
+				cos(phase * 0.8) * spread * 0.35)
+			var flip := -1.0 if cos(phase) < -0.6 else 1.0
+			draw_colored_polygon(PackedVector2Array([
+				p, p + Vector2(-5.0 * flip, -2.0), p + Vector2(-5.0 * flip, 2.0)
+			]), fish_color)
+			draw_circle(p, 1.0, Color(0.8, 0.95, 0.85, 0.8))
+
+class Interior extends Node2D:
+	var t := 0.0
+	var depth := 0.0
+	var contact_strength := 0.0
+	func _process(d: float) -> void:
+		t += d
+		queue_redraw()
+	func _draw() -> void:
+		# View fills the viewport; close bulkheads make the cabin feel barely habitable.
+		draw_rect(Rect2(-190, -115, 380, 230), Color(0.008, 0.012, 0.016))
+		draw_rect(Rect2(-190, -115, 380, 14), Color(0.055, 0.065, 0.067))
+		draw_rect(Rect2(-190, 101, 380, 14), Color(0.045, 0.052, 0.055))
+		# Close ribs, bolts and damp seams.
+		for i in 9:
+			var x := -177.0 + float(i) * 44.0
+			draw_rect(Rect2(x, -101, 4, 202), Color(0.035, 0.045, 0.048))
+			for y in [-91.0, 91.0]:
+				draw_circle(Vector2(x + 2, y), 1.2, Color(0.20, 0.12, 0.10))
+		# Thick porthole with a barely visible ocean outside.
+		draw_circle(Vector2(-112, -17), 42, Color(0.12, 0.14, 0.14))
+		draw_circle(Vector2(-112, -17), 35, Color(0.002, 0.012, 0.019))
+		draw_arc(Vector2(-112, -17), 38, 0, TAU, 36, Color(0.26, 0.29, 0.28), 4.0)
+		draw_line(Vector2(-143, -38), Vector2(-131, -29), Color(0.11, 0.20, 0.22, 0.35), 1.0)
+		# Weak red emergency bulbs: small pools, not a bright room.
+		for i in 3:
+			var lx := -150.0 + float(i) * 150.0
+			var pulse := 0.25 + 0.18 * (0.5 + 0.5 * sin(t * 2.2 + float(i)))
+			draw_circle(Vector2(lx, -78), 10.0, Color(0.55, 0.015, 0.01, 0.045))
+			draw_circle(Vector2(lx, -78), 3.0, Color(0.75, 0.035, 0.02, pulse))
+		# Crowded console, switches, analogue pressure gauge and alarm strip.
+		draw_colored_polygon(PackedVector2Array([Vector2(-26, 12), Vector2(177, 12), Vector2(166, 65), Vector2(-18, 65)]), Color(0.045, 0.055, 0.056))
+		draw_rect(Rect2(-13, 18, 62, 32), Color(0.008, 0.035, 0.026))
+		draw_rect(Rect2(-10, 21, 56, 26), Color(0.005, 0.02, 0.018))
+		draw_line(Vector2(-4, 38), Vector2(37, 29 + sin(t * 2.0) * 4.0), Color(0.18, 0.88, 0.42), 1.4)
+		draw_circle(Vector2(77, 33), 15.0, Color(0.08, 0.09, 0.085))
+		draw_arc(Vector2(77, 33), 11.0, PI, TAU, 18, Color(0.65, 0.68, 0.58), 1.0)
+		draw_line(Vector2(77, 33), Vector2(83, 25), Color(0.8, 0.15, 0.08), 1.5)
+		for i in 7:
+			var bx := -4.0 + float(i) * 24.0
+			draw_rect(Rect2(bx, 53, 8, 5), Color(0.16, 0.18, 0.16))
+			draw_circle(Vector2(bx + 4, 55), 1.4, Color(0.7, 0.045, 0.02, 0.6 + 0.3 * sin(t * 4.0 + float(i))))
+		draw_string(ThemeDB.fallback_font, Vector2(-10, 9), "PRESSURE / BALLAST", HORIZONTAL_ALIGNMENT_LEFT, -1, 6, Color(0.48, 0.24, 0.18))
+		# Classic green CRT sonar: phosphor sweep line rotates and contact blips pulse.
+		var sc := Vector2(105, -35)
+		draw_rect(Rect2(54, -89, 99, 101), Color(0.018, 0.028, 0.025))
+		draw_rect(Rect2(58, -85, 91, 93), Color(0.005, 0.025, 0.016))
+		for r in [13.0, 26.0, 39.0]:
+			draw_arc(sc, r, 0.0, TAU, 40, Color(0.08, 0.32, 0.17, 0.75), 1.0)
+		draw_line(Vector2(sc.x - 42, sc.y), Vector2(sc.x + 42, sc.y), Color(0.05, 0.20, 0.11, 0.7), 1.0)
+		draw_line(Vector2(sc.x, sc.y - 42), Vector2(sc.x, sc.y + 42), Color(0.05, 0.20, 0.11, 0.7), 1.0)
+		var ang := fposmod(t * 2.3, TAU)
+		draw_line(sc, sc + Vector2(cos(ang), sin(ang)) * 39.0, Color(0.30, 1.0, 0.48, 0.95), 1.5)
+		draw_line(sc, sc + Vector2(cos(ang - 0.12), sin(ang - 0.12)) * 39.0, Color(0.12, 0.48, 0.22, 0.55), 3.0)
+		var pulse := 0.55 + 0.45 * sin(t * 4.0)
+		draw_circle(sc + Vector2(17, -12), 2.0, Color(0.4, 1.0, 0.46, pulse))
+		if depth > 650.0:
+			draw_circle(sc + Vector2(-24, 18), 2.4, Color(0.65, 1.0, 0.42, 0.9))
+		if depth > 1150.0:
+			draw_circle(sc + Vector2(6, 30), 2.7, Color(0.65, 1.0, 0.42, pulse))
+		if depth > 1600.0:
+			draw_circle(sc + Vector2(-32, -19), 3.0, Color(0.9, 0.96, 0.32, pulse))
+		draw_string(ThemeDB.fallback_font, Vector2(61, -94), "SONAR / ACTIVE", HORIZONTAL_ALIGNMENT_LEFT, -1, 7, Color(0.28, 0.9, 0.46))
+		# Red emergency wash along the lower edge, flickering as pressure rises.
+		draw_rect(Rect2(-190, 92, 380, 8), Color(0.30, 0.008, 0.005, 0.15 + 0.12 * sin(t * 6.0)))
+
+
+
+class Eyes extends Node2D:
+	## Drawn in a CanvasLayer that ignores the darkness, so eyes + lure glow in the black.
+	var c: Creature
+	func _process(_d: float) -> void:
+		if c == null:
+			return
+		position = c.position
+		scale = c.scale
+		queue_redraw()
+	func _draw() -> void:
+		if c == null:
+			return
+		var blink := 1.0 if fmod(c.t, 5.0) > 0.15 else 0.1
+		var ang := c.heading
+		var flip := -1.0 if cos(ang) < 0.0 else 1.0
+		for s in [-1.0, 1.0]:
+			var p := Vector2(8.0, 5.5 * s).rotated(ang)
+			draw_circle(p, 7.0, Color(1.0, 0.6, 0.1, 0.08 * blink))
+			draw_circle(p, 4.5, Color(1.0, 0.75, 0.2, 0.18 * blink))
+			draw_circle(p, 3.0, Color(1.0, 0.9, 0.5, 0.95 * blink))
+			draw_line(p + Vector2(0, -2.5).rotated(ang), p + Vector2(0, 2.5).rotated(ang), Color(0, 0, 0, blink), 1.0)
+		var lure := Vector2(34.0 + sin(c.t * 2.0) * 2.0, (-16.0 + cos(c.t * 1.7) * 2.0) * flip).rotated(ang)
+		draw_circle(lure, 8.0, Color(0.3, 0.9, 1.0, 0.10))
+		draw_circle(lure, 4.0, Color(0.4, 0.95, 1.0, 0.35))
+		draw_circle(lure, 2.0, Color(0.85, 1.0, 1.0, 0.95))
+
+
+class Marker extends Node2D:
+	var active := false
+	var t := 0.0
+	func _process(d: float) -> void:
+		t += d
+		queue_redraw()
+	func _draw() -> void:
+		if not active:
+			return
+		var r := 2.0 + fposmod(t * 6.0, 5.0)
+		draw_arc(Vector2.ZERO, r, 0.0, TAU, 14, Color(0.6, 1.0, 0.9, 0.8), 1.0)
+		draw_circle(Vector2.ZERO, 1.0, Color(0.6, 1.0, 0.9, 0.9))
+
+
+# ================================================================ SETUP
+
+func _ready() -> void:
+	randomize()
+	var w := get_window()
+	w.content_scale_size = Vector2i(1280, 720)
+	w.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
+	w.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND
+	DisplayServer.screen_set_orientation(DisplayServer.SCREEN_SENSOR_LANDSCAPE)
+	_build_display()
+	_build_world()
+	_build_ui()
+	_build_audio()
+	get_viewport().size_changed.connect(_fit)
+	_fit()
+	_say("MISSION BRIEF: Sub hull rating MAX 2,000 m. Exceeding rated depth will implode the pressure capsule. Board at the stern.", 10.0)
+
+
+func _build_display() -> void:
+	sub_vp = SubViewport.new()
+	sub_vp.size = Vector2i(320, 180)
+	sub_vp.canvas_item_default_texture_filter = Viewport.DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_NEAREST
+	sub_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	add_child(sub_vp)
+
+	var layer := CanvasLayer.new()
+	layer.layer = 0
+	add_child(layer)
+	display = TextureRect.new()
+	display.texture = sub_vp.get_texture()
+	display.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	display.stretch_mode = TextureRect.STRETCH_SCALE
+	display.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	display.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	display.set_anchors_preset(Control.PRESET_FULL_RECT)
+
+	var sh := Shader.new()
+	sh.code = """
+shader_type canvas_item;
+uniform vec2 res = vec2(320.0, 180.0);
+uniform float fear = 0.0;
+uniform float murk = 0.0;
+uniform float blackout = 0.0;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void fragment() {
+	vec2 uv = UV;
+	float t = TIME;
+	uv.x += sin(uv.y * 60.0 + t * 1.7) * (0.0008 + fear * 0.0025);
+	uv.y += sin(uv.x * 45.0 + t * 1.3) * 0.0006;
+	float jit = step(0.97, hash(vec2(floor(t * 10.0), 3.0)));
+	uv.x += jit * fear * 0.02 * (hash(vec2(floor(uv.y * res.y * 0.25), floor(t * 10.0))) - 0.5);
+	float ca = (1.2 + fear * 3.0) / res.x;
+	vec3 col;
+	col.r = texture(TEXTURE, uv + vec2(ca, 0.0)).r;
+	col.g = texture(TEXTURE, uv).g;
+	col.b = texture(TEXTURE, uv - vec2(ca, 0.0)).b;
+	vec2 px = floor(UV * res);
+	float n = hash(px + floor(t * 14.0) * 17.0);
+	col += (n - 0.5) * (0.10 + murk * 0.10);
+	col *= 0.92 + 0.08 * sin(UV.y * res.y * 3.14159);
+	float vig = smoothstep(0.85, 0.2, distance(UV, vec2(0.5)));
+	col *= mix(0.25, 1.0, vig);
+	col *= 1.0 - blackout * 0.995;
+	float g = dot(col, vec3(0.299, 0.587, 0.114));
+	col = mix(col, vec3(g) * vec3(0.75, 1.0, 0.95), 0.3 + murk * 0.3);
+	col = mix(col, col * vec3(1.5, 0.55, 0.55), fear * 0.45);
+	col = floor(col * 14.0 + 0.5) / 14.0;
+	COLOR = vec4(col, 1.0);
+}
+"""
+	fx = ShaderMaterial.new()
+	fx.shader = sh
+	display.material = fx
+	layer.add_child(display)
+
+
+func _fit() -> void:
+	# keeps pixels square on any phone/tablet/desktop aspect ratio
+	var win := get_viewport().get_visible_rect().size
+	var asp := win.x / win.y
+	if asp >= 1.0:
+		sub_vp.size = Vector2i(roundi(BASE_H * asp), int(BASE_H))
+	else:
+		sub_vp.size = Vector2i(int(BASE_H), roundi(BASE_H / asp))
+	fx.set_shader_parameter("res", Vector2(sub_vp.size))
+
+
+func _cone_texture() -> ImageTexture:
+	var img := Image.create(256, 256, false, Image.FORMAT_RGBA8)
+	for y in 256:
+		for x in 256:
+			var dx := float(x)
+			var dy := float(y) - 127.5
+			var ang := absf(atan2(dy, maxf(dx, 0.001)))
+			var ln := sqrt(dx * dx + dy * dy) / 256.0
+			var a := smoothstep(0.55, 0.05, ang) * clampf(1.0 - ln, 0.0, 1.0)
+			a = maxf(a, clampf(1.0 - ln * 6.0, 0.0, 1.0) * 0.6)
+			img.set_pixel(x, y, Color(a, a, a, 1.0))
+	return ImageTexture.create_from_image(img)
+
+
+func _build_world() -> void:
+	world = Node2D.new()
+	sub_vp.add_child(world)
+	canvas_mod = CanvasModulate.new()
+	world.add_child(canvas_mod)
+	world.add_child(Backdrop.new())
+	var terrain := Terrain.new()
+	terrain.seabed_y = SEABED_Y
+	terrain.half_w = HALF_W
+	world.add_child(terrain)
+
+	ship = Ship.new()
+	world.add_child(ship)
+	hero = Hero.new()
+	hero.position = Vector2(30, -20)
+	ship.add_child(hero)
+	# Tiny sediment puffs at the boots: a soft underwater substitute for dry dust.
+	foot_silt = CPUParticles2D.new()
+	foot_silt.name = "FootstepSilt"
+	foot_silt.amount = 18
+	foot_silt.lifetime = 0.48
+	foot_silt.explosiveness = 0.0
+	foot_silt.randomness = 0.75
+	foot_silt.local_coords = true
+	foot_silt.emission_shape = CPUParticles2D.EMISSION_SHAPE_POINT
+	foot_silt.position = Vector2(0, -1)
+	foot_silt.direction = Vector2(0, 1)
+	foot_silt.spread = 75.0
+	foot_silt.gravity = Vector2(0, 7)
+	foot_silt.initial_velocity_min = 3.0
+	foot_silt.initial_velocity_max = 11.0
+	foot_silt.scale_amount_min = 0.45
+	foot_silt.scale_amount_max = 1.25
+	foot_silt.color = Color(0.55, 0.67, 0.58, 0.48)
+	foot_silt.emitting = false
+	hero.add_child(foot_silt)
+	world.add_child(Waves.new())
+
+	sub = Sub.new()
+	sub.position = Vector2(-175, 8)
+	world.add_child(sub)
+	# Rising bubbles from the hull and a faint, fast-moving thruster wake.
+	sub_bubbles = CPUParticles2D.new()
+	sub_bubbles.name = "HullBubbles"
+	sub_bubbles.amount = 34
+	sub_bubbles.lifetime = 1.8
+	sub_bubbles.preprocess = 1.2
+	sub_bubbles.local_coords = true
+	sub_bubbles.emission_shape = CPUParticles2D.EMISSION_SHAPE_RECTANGLE
+	sub_bubbles.emission_rect_extents = Vector2(15, 5)
+	sub_bubbles.position = Vector2(-2, -9)
+	sub_bubbles.direction = Vector2(-0.15, -1)
+	sub_bubbles.spread = 28.0
+	sub_bubbles.gravity = Vector2(0, -3)
+	sub_bubbles.initial_velocity_min = 3.0
+	sub_bubbles.initial_velocity_max = 10.0
+	sub_bubbles.scale_amount_min = 0.35
+	sub_bubbles.scale_amount_max = 1.1
+	sub_bubbles.color = Color(0.55, 0.88, 0.92, 0.62)
+	sub_bubbles.emitting = true
+	sub.add_child(sub_bubbles)
+
+	sub_wake = CPUParticles2D.new()
+	sub_wake.name = "ThrusterWake"
+	sub_wake.amount = 22
+	sub_wake.lifetime = 0.65
+	sub_wake.local_coords = true
+	sub_wake.position = Vector2(-24, 0)
+	sub_wake.direction = Vector2(-1, 0)
+	sub_wake.spread = 20.0
+	sub_wake.gravity = Vector2(0, 0)
+	sub_wake.initial_velocity_min = 5.0
+	sub_wake.initial_velocity_max = 18.0
+	sub_wake.scale_amount_min = 0.3
+	sub_wake.scale_amount_max = 0.8
+	sub_wake.color = Color(0.42, 0.72, 0.75, 0.32)
+	sub_wake.emitting = false
+	sub.add_child(sub_wake)
+
+	creature = Creature.new()
+	creature.position = creature.home
+	creature.apex = true
+	creature.scale = Vector2(1.25, 1.25)
+	creature.body_col = Color(0.28, 0.34, 0.36)
+	world.add_child(creature)
+
+	# Smaller but increasingly malformed predators appear at successive depth bands.
+	for i in 3:
+		var hunter := Creature.new()
+		hunter.home = [Vector2(-500.0, 720.0), Vector2(680.0, 1240.0), Vector2(-720.0, 1690.0)][i]
+		hunter.position = hunter.home
+		hunter.body_col = [Color(0.31, 0.42, 0.38), Color(0.30, 0.24, 0.30), Color(0.25, 0.28, 0.34)][i]
+		hunter.scale = Vector2([0.58, 0.72, 0.88][i], [0.58, 0.72, 0.88][i])
+		world.add_child(hunter)
+		deep_creatures.append(hunter)
+
+	# Schools drift through the upper water column, where the player first encounters life.
+	for i in 7:
+		var school := FishSchool.new()
+		school.position = Vector2(randf_range(-950.0, 950.0), randf_range(140.0, 1050.0))
+		school.swim_speed = randf_range(8.0, 24.0)
+		school.fish_count = randi_range(6, 13)
+		school.spread = randf_range(28.0, 70.0)
+		school.fish_color = [Color(0.30, 0.68, 0.75, 0.9), Color(0.62, 0.66, 0.48, 0.9), Color(0.40, 0.55, 0.68, 0.9)][i % 3]
+		world.add_child(school)
+		fish_schools.append(school)
+
+	# Keep the cockpit on its own canvas layer so the world darkness shader and
+	# CanvasModulate cannot black it out. Its coordinates are screen-centered.
+	interior_layer = CanvasLayer.new()
+	interior_layer.layer = 2
+	sub_vp.add_child(interior_layer)
+	interior = Interior.new()
+	interior.visible = false
+	interior.position = Vector2(sub_vp.size) * 0.5
+	interior_layer.add_child(interior)
+
+	# marine snow
+	snow = CPUParticles2D.new()
+	snow.amount = 120
+	snow.lifetime = 7.0
+	snow.preprocess = 7.0
+	snow.local_coords = false
+	snow.emission_shape = CPUParticles2D.EMISSION_SHAPE_RECTANGLE
+	snow.emission_rect_extents = Vector2(240, 160)
+	snow.direction = Vector2(0, 1)
+	snow.spread = 180.0
+	snow.gravity = Vector2(0, 4)
+	snow.initial_velocity_min = 2.0
+	snow.initial_velocity_max = 9.0
+	snow.scale_amount_min = 1.0
+	snow.scale_amount_max = 1.8
+	snow.color = Color(0.8, 0.95, 1.0, 0.7)
+	snow.emitting = false
+	world.add_child(snow)
+
+	ambient_bubbles = CPUParticles2D.new()
+	ambient_bubbles.name = "DeepWaterBubbles"
+	ambient_bubbles.amount = 42
+	ambient_bubbles.lifetime = 8.0
+	ambient_bubbles.preprocess = 5.0
+	ambient_bubbles.local_coords = false
+	ambient_bubbles.emission_shape = CPUParticles2D.EMISSION_SHAPE_RECTANGLE
+	ambient_bubbles.emission_rect_extents = Vector2(245, 165)
+	ambient_bubbles.direction = Vector2(-0.08, -1)
+	ambient_bubbles.spread = 18.0
+	ambient_bubbles.gravity = Vector2(0, -1.5)
+	ambient_bubbles.initial_velocity_min = 1.0
+	ambient_bubbles.initial_velocity_max = 4.0
+	ambient_bubbles.scale_amount_min = 0.25
+	ambient_bubbles.scale_amount_max = 0.7
+	ambient_bubbles.color = Color(0.55, 0.82, 0.9, 0.38)
+	ambient_bubbles.emitting = false
+	world.add_child(ambient_bubbles)
+
+	# submarine lights
+	beam = PointLight2D.new()
+	beam.texture = _cone_texture()
+	beam.offset = Vector2(128, 0)
+	beam.energy = 1.2
+	beam.color = Color(0.8, 0.95, 1.0)
+	sub.add_child(beam)
+
+	var gt := GradientTexture2D.new()
+	gt.fill = GradientTexture2D.FILL_RADIAL
+	gt.fill_from = Vector2(0.5, 0.5)
+	gt.fill_to = Vector2(1.0, 0.5)
+	gt.width = 128
+	gt.height = 128
+	var grad := Gradient.new()
+	grad.set_color(0, Color.WHITE)
+	grad.set_color(1, Color.BLACK)
+	gt.gradient = grad
+	glow = PointLight2D.new()
+	glow.texture = gt
+	glow.texture_scale = 1.4
+	glow.energy = 0.5
+	glow.color = Color(0.4, 0.7, 0.8)
+	sub.add_child(glow)
+
+	# layer that ignores the darkness: glowing eyes + tap marker
+	glow_layer = CanvasLayer.new()
+	glow_layer.follow_viewport_enabled = true
+	sub_vp.add_child(glow_layer)
+	eyes = Eyes.new()
+	eyes.c = creature
+	glow_layer.add_child(eyes)
+	marker = Marker.new()
+	glow_layer.add_child(marker)
+
+	cam = Camera2D.new()
+	cam.position_smoothing_enabled = true
+	cam.position_smoothing_speed = 5.0
+	cam.limit_left = int(-HALF_W)
+	cam.limit_right = int(HALF_W)
+	cam.limit_top = -400
+	cam.limit_bottom = int(SEABED_Y + 40.0)
+	world.add_child(cam)
+	cam.position = hero.global_position
+
+
+func _build_ui() -> void:
+	var ui := CanvasLayer.new()
+	ui.layer = 10
+	add_child(ui)
+
+	status = _make_label(26)
+	status.position = Vector2(24, 16)
+	ui.add_child(status)
+
+	# Sonar is physically drawn on the submarine's interior CRT, never in the HUD.
+	sonar = _make_label(18)
+	sonar.visible = false
+	ui.add_child(sonar)
+
+	hint = _make_label(24)
+	hint.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	hint.offset_top = -90
+	hint.offset_bottom = -16
+	hint.offset_left = 24
+	hint.offset_right = -240
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+	ui.add_child(hint)
+
+	photo_btn = Button.new()
+	photo_btn.text = "PHOTO"
+	photo_btn.custom_minimum_size = Vector2(190, 110)
+	photo_btn.add_theme_font_size_override("font_size", 34)
+	photo_btn.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	photo_btn.anchor_left = 0.5
+	photo_btn.anchor_right = 0.5
+	photo_btn.anchor_top = 1.0
+	photo_btn.anchor_bottom = 1.0
+	photo_btn.offset_left = -95
+	photo_btn.offset_right = 95
+	photo_btn.offset_top = -122
+	photo_btn.offset_bottom = -12
+	photo_btn.visible = false
+	photo_btn.pressed.connect(_take_photo)
+	ui.add_child(photo_btn)
+
+	view_toggle = Button.new()
+	view_toggle.text = "VIEW: INSIDE"
+	view_toggle.custom_minimum_size = Vector2(170, 48)
+	view_toggle.add_theme_font_size_override("font_size", 20)
+	view_toggle.anchor_left = 1.0
+	view_toggle.anchor_right = 1.0
+	view_toggle.anchor_top = 1.0
+	view_toggle.anchor_bottom = 1.0
+	view_toggle.offset_left = -190
+	view_toggle.offset_right = -16
+	view_toggle.offset_top = -68
+	view_toggle.offset_bottom = -16
+	view_toggle.visible = false
+	view_toggle.pressed.connect(_toggle_view)
+	ui.add_child(view_toggle)
+
+	flash = ColorRect.new()
+	flash.color = Color(1, 1, 1, 0)
+	flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	flash.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	ui.add_child(flash)
+
+	center_lbl = _make_label(46)
+	center_lbl.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	center_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	center_lbl.visible = false
+	ui.add_child(center_lbl)
+
+
+func _make_label(size: int) -> Label:
+	var l := Label.new()
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", Color(0.78, 0.95, 0.9))
+	l.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.85))
+	l.add_theme_constant_override("shadow_offset_x", 2)
+	l.add_theme_constant_override("shadow_offset_y", 2)
+	return l
+
+
+func _build_audio() -> void:
+	var p := AudioStreamPlayer.new()
+	var g := AudioStreamGenerator.new()
+	g.mix_rate = MIX_RATE
+	g.buffer_length = 0.3
+	p.stream = g
+	p.volume_db = -4.0
+	add_child(p)
+	p.play()
+	gen_playback = p.get_stream_playback() as AudioStreamGeneratorPlayback
+
+
+# ================================================================ INPUT
+
+func _unhandled_input(ev: InputEvent) -> void:
+	var pos := Vector2.ZERO
+	var got := false
+	if ev is InputEventMouseButton:
+		var mb := ev as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
+			pos = mb.position
+			got = true
+	elif ev is InputEventMouseMotion:
+		var mm := ev as InputEventMouseMotion
+		if mm.button_mask & MOUSE_BUTTON_MASK_LEFT:
+			pos = mm.position
+			got = true
+	if not got:
+		return
+	if state == S.DEAD or state == S.WON:
+		if dead_t > 2.0:
+			get_tree().reload_current_scene()
+		return
+	if state == S.BOARDING or state == S.DESCENDING:
+		return
+	if state == S.INTERIOR:
+		# Tap the console area to walk to the controls.
+		target = Vector2(55.0, 0.0)
+		has_target = true
+		return
+	target = _screen_to_world(pos)
+	has_target = true
+	marker.position = target
+
+
+func _screen_to_world(p: Vector2) -> Vector2:
+	var win := get_viewport().get_visible_rect().size
+	var vs := Vector2(sub_vp.size)
+	var sp := p / win * vs
+	return cam.get_screen_center_position() + (sp - vs * 0.5)
+
+
+# ================================================================ GAME LOOP
+
+func _process(delta: float) -> void:
+	time += delta
+	photo_cd = maxf(photo_cd - delta, 0.0)
+	match state:
+		S.SHIP:
+			_update_ship(delta)
+		S.INTERIOR:
+			_update_interior(delta)
+		S.DESCENDING:
+			_update_descend(delta)
+		S.DIVING, S.ESCAPE:
+			_update_dive(delta)
+		S.DEAD, S.WON:
+			_update_end(delta)
+	marker.active = has_target and (state == S.SHIP or state == S.DIVING or state == S.ESCAPE)
+	_update_camera(delta)
+	_update_atmosphere(delta)
+	_update_ui(delta)
+	_fill_audio(delta)
+
+
+func _update_ship(delta: float) -> void:
+	var want := 0.0
+	if has_target:
+		var dx := target.x - hero.global_position.x
+		if absf(dx) > 3.0:
+			want = signf(dx) * 34.0
+		else:
+			has_target = false
+	hero_vx = move_toward(hero_vx, want, 160.0 * delta)
+	hero.position.x = clampf(hero.position.x + hero_vx * delta, -112.0, 108.0)
+	hero.walking = absf(hero_vx) > 4.0
+	if foot_silt != null:
+		foot_silt.emitting = hero.walking
+	if absf(hero_vx) > 4.0:
+		hero.facing = signf(hero_vx)
+	if hero.position.x <= -104.0:
+		_board()
+
+
+func _board() -> void:
+	state = S.BOARDING
+	has_target = false
+	hero.walking = false
+	hero.facing = -1.0
+	var tw := create_tween()
+	tw.tween_property(hero, "global_position", sub.global_position + Vector2(0, -12), 0.8).set_trans(Tween.TRANS_QUAD)
+	tw.tween_callback(func() -> void:
+		ship.visible = false
+		sub.visible = false
+		for child in world.get_children():
+			if child != cam and child != interior:
+				child.visible = false
+		hero.reparent(world)
+		hero.position = Vector2(-70.0, 8.0)
+		hero.visible = true
+		hero.facing = 1.0
+		interior.visible = true
+		interior.position = Vector2(sub_vp.size) * 0.5
+		cam.position = Vector2.ZERO
+		state = S.INTERIOR
+		_say("CRAMPED CONTROL CAPSULE. MAX RATED DEPTH: 2,000 m. Walk to the console on the right to begin.", 8.0))
+
+
+func _update_interior(delta: float) -> void:
+	interior.position = Vector2(sub_vp.size) * 0.5
+	var want := 0.0
+	if has_target:
+		var dx := 55.0 - hero.position.x
+		if absf(dx) > 2.0:
+			want = signf(dx) * 28.0
+		else:
+			has_target = false
+			hero.walking = false
+			hero_vx = 0.0
+			state = S.DESCENDING
+			interior.visible = false
+			for child in world.get_children():
+				if child != cam and child != interior:
+					child.visible = true
+			hero.visible = false
+			ship.visible = true
+			sub.visible = true
+			sub.position = Vector2(-175.0, 8.0)
+			descend_speed = 0.0
+			_say("Controls engaged. The cable lowers you into black water.", 6.0)
+	hero_vx = move_toward(hero_vx, want, 130.0 * delta)
+	hero.position.x = move_toward(hero.position.x, 55.0, absf(hero_vx) * delta)
+	hero.walking = absf(hero_vx) > 2.0
+	if foot_silt != null:
+		foot_silt.emitting = hero.walking
+	if absf(hero_vx) > 2.0:
+		hero.facing = signf(hero_vx)
+
+func _update_descend(delta: float) -> void:
+	descend_speed = move_toward(descend_speed, 38.0, 15.0 * delta)
+	sub.position.y += descend_speed * delta
+	sub.face_dir = 1.0
+	sub.facing = move_toward(sub.facing, 1.0, 6.0 * delta)
+	ship.cable_to = ship.to_local(sub.global_position + Vector2(0, -12))
+	if sub.position.y > 220.0:
+		ship.cable_on = false
+		state = S.DIVING
+		photo_btn.visible = true
+		_say("Cable released. Find the creature. Tap to steer. Press PHOTO when it's in your light.", 8.0)
+
+
+func _update_dive(delta: float) -> void:
+	# Interior-view cockpit stays locked around the moving submersible.
+	interior.position = Vector2(sub_vp.size) * 0.5
+	interior.depth = sub.position.y
+	interior.visible = view_inside
+	# ---- natural, inertial steering toward the tapped point
+	var desired := Vector2.ZERO
+	var accel := 35.0
+	if has_target:
+		var to_t := target - sub.position
+		var dist_t := to_t.length()
+		if dist_t < 5.0:
+			has_target = false
+		else:
+			desired = to_t / dist_t * minf(SUB_MAX_SPEED, dist_t * 1.6)   # eases in as it arrives
+			accel = SUB_ACCEL
+	sub.vel = sub.vel.move_toward(desired, accel * delta)
+	sub.vel += Vector2(sin(time * 0.4), cos(time * 0.33)) * 2.0 * delta     # slow current
+	sub.position += sub.vel * delta
+	if sub_wake != null:
+		sub_wake.emitting = sub.vel.length() > 12.0 and (state == S.DIVING or state == S.ESCAPE)
+	var min_y := 40.0
+	if state == S.ESCAPE:
+		min_y = 0.0
+	sub.position.x = clampf(sub.position.x, -HALF_W + 30.0, HALF_W - 30.0)
+	sub.position.y = clampf(sub.position.y, min_y, SEABED_Y - 30.0)
+
+	# At 2,000 m, pressure wins: darkness builds, a deep shriek sounds, then the hull implodes.
+	if sub.position.y >= 2000.0 and not depth_scare_started:
+		depth_scare_started = true
+		view_inside = false
+		interior.visible = false
+		implosion_t = 0.0
+		scare_env = 1.0
+		event_age = 0.0
+		event_kind = 3
+		event_len = 4.0
+		_say("MAX DEPTH EXCEEDED — 2,000 m. PRESSURE CASCADE IN PROGRESS. THE HULL IS FOLDING IN.", 5.0)
+	if depth_scare_started and state == S.DIVING:
+		implosion_t += delta
+		sub.implosion_factor = clampf(implosion_t / 5.0, 0.0, 1.0)
+		depth_blackout = clampf((sub.position.y - 2000.0) / 260.0 + implosion_t / 7.0, 0.0, 1.0)
+		if implosion_t < 4.0:
+			center_lbl.text = "PRESSURE CASCADE\nHULL DEFORMATION DETECTED"
+			center_lbl.visible = true
+			center_lbl.add_theme_color_override("font_color", Color(0.92, 0.22, 0.12, clampf(implosion_t / 1.2, 0.0, 1.0)))
+		if implosion_t >= 5.0:
+			_implode()
+			return
+
+	if absf(sub.vel.x) > 8.0:
+		sub.face_dir = signf(sub.vel.x)
+	sub.facing = move_toward(sub.facing, sub.face_dir, 5.0 * delta)
+	var spd := sub.vel.length()
+	var want_tilt := 0.0
+	if spd > 6.0:
+		want_tilt = clampf(sub.face_dir * atan2(sub.vel.y, absf(sub.vel.x) + 10.0), -0.9, 0.9)
+	sub.tilt = lerpf(sub.tilt, want_tilt, 3.0 * delta)
+
+	beam.position = Vector2(sub.facing * 20.0, 0.0).rotated(sub.tilt)
+	beam.rotation = sub.tilt
+	beam.scale = Vector2(sub.facing * 0.7, 0.7)
+
+	# ---- apex creature and depth-banded hunters
+	creature.target_pos = sub.position
+	creature.escape = (state == S.ESCAPE)
+	for hunter in deep_creatures:
+		hunter.target_pos = sub.position
+		hunter.escape = (state == S.ESCAPE)
+		if hunter.caught:
+			_die()
+			return
+	if creature.mode != prev_mode:
+		if creature.mode == Creature.M.CHARGE:
+			scare_env = maxf(scare_env, 0.35)
+			shake_spike += 2.0
+		prev_mode = creature.mode
+	if creature.caught:
+		_die()
+		return
+	if state == S.ESCAPE and sub.position.y < 55.0:
+		_win()
+
+
+func _take_photo() -> void:
+	if state != S.DIVING or photo_cd > 0.0:
+		return
+	photo_cd = 1.5
+	flash_a = 1.0
+	flash_col = Color.WHITE
+	click_env = 1.0
+	var to_c := creature.position - sub.position
+	var fwd := Vector2(sub.face_dir, 0.0).rotated(sub.tilt)
+	var ang := absf(fwd.angle_to(to_c))
+	if to_c.length() < 150.0 and ang < 0.9:
+		photos += 1
+		creature.flee()
+		fear_spike = 1.0
+		shake_spike += 4.0
+		scare_env = maxf(scare_env, 0.5)
+		if photos >= PHOTOS_NEEDED:
+			state = S.ESCAPE
+			photo_btn.visible = false
+			_say("That's all of them. Get to the surface. NOW.", 8.0)
+		else:
+			_say("Photo %d of %d captured. It didn't like that." % [photos, PHOTOS_NEEDED], 5.0)
+	else:
+		_say("Nothing in frame. Point your light at it and get closer.", 3.0)
+
+
+func _implode() -> void:
+	if state == S.DEAD:
+		return
+	state = S.DEAD
+	dead_t = 0.0
+	has_target = false
+	photo_btn.visible = false
+	view_toggle.visible = false
+	view_inside = false
+	interior.visible = false
+	scare_env = 1.0
+	shake_spike = 18.0
+	flash_a = 1.0
+	flash_col = Color(0.9, 0.95, 1.0)
+	sub.visible = false
+	beam.energy = 0.0
+	glow.energy = 0.0
+	center_lbl.text = "HULL FAILURE\nPRESSURE CASCADE\n\nSUBMERSIBLE IMPLODED"
+	center_lbl.visible = true
+	center_lbl.add_theme_color_override("font_color", Color(1.0, 0.16, 0.12))
+	view_toggle.visible = false
+	view_inside = false
+	interior.visible = false
+	_say("...", 2.0)
+
+func _die() -> void:
+	state = S.DEAD
+	dead_t = 0.0
+	has_target = false
+	photo_btn.visible = false
+	view_toggle.visible = false
+	view_inside = false
+	interior.visible = false
+	scare_env = 1.0
+	shake_spike = 9.0
+	flash_a = 0.9
+	flash_col = Color(0.8, 0.05, 0.05)
+	creature.frozen = true
+	for hunter in deep_creatures:
+		hunter.frozen = true
+	creature.set_mode(Creature.M.CHARGE)
+	creature.heading = 0.0
+	sub.visible = false
+	beam.energy = 0.0
+	glow.energy = 1.6
+	glow.color = Color(1.0, 0.3, 0.3)
+	center_lbl.text = "THE DEEP TAKES YOU"
+
+
+func _win() -> void:
+	state = S.WON
+	dead_t = 0.0
+	creature.escape = false
+	creature.flee()
+	photo_btn.visible = false
+	view_toggle.visible = false
+	view_inside = false
+	interior.visible = false
+	center_lbl.text = "YOU BROKE THE SURFACE\n%d photos. Don't look at them.\n\ntap to dive again" % photos
+	center_lbl.visible = true
+
+
+func _update_end(delta: float) -> void:
+	dead_t += delta
+	if state == S.DEAD:
+		if not depth_scare_started:
+			var s := lerpf(creature.scale.x, 6.5, 8.0 * delta)
+			creature.scale = Vector2(s, s)
+			creature.position = creature.position.lerp(sub.position, 10.0 * delta)
+		if dead_t > 2.4:
+			center_lbl.text = ("HULL FAILURE\nSUBMERSIBLE IMPLODED\n\ntap to try again" if depth_scare_started else "THE DEEP TAKES YOU\n\ntap to try again")
+			center_lbl.visible = true
+			center_lbl.add_theme_color_override("font_color", Color(0.9, 0.2, 0.2))
+	else:
+		sub.vel = sub.vel.move_toward(Vector2.ZERO, 30.0 * delta)
+		sub.position += sub.vel * delta
+
+
+func _update_camera(delta: float) -> void:
+	var tp := sub.position
+	if state == S.SHIP or state == S.BOARDING:
+		tp = hero.global_position + Vector2(0, -16)
+	elif state == S.INTERIOR:
+		tp = Vector2.ZERO
+	elif view_inside and (state == S.DIVING or state == S.ESCAPE):
+		tp = sub.position
+	cam.position = tp
+	var sh := fear * 1.0 + shake_spike
+	if creature.mode == Creature.M.CHARGE and state != S.DEAD:
+		sh += 1.5
+	cam.offset = Vector2(roundf(randf_range(-1.0, 1.0) * sh), roundf(randf_range(-1.0, 1.0) * sh))
+	shake_spike = move_toward(shake_spike, 0.0, 6.0 * delta)
+
+
+func _update_atmosphere(delta: float) -> void:
+	var depth := maxf(sub.position.y, 0.0)
+	if state == S.SHIP or state == S.BOARDING or state == S.INTERIOR:
+		depth = 0.0
+	k_depth = clampf(depth / 900.0, 0.0, 1.0)
+	canvas_mod.color = Color(0.85, 0.92, 0.95).lerp(Color(0.025, 0.035, 0.06), pow(k_depth, 0.7))
+	snow.global_position = cam.get_screen_center_position()
+	snow.emitting = depth > 120.0
+	if ambient_bubbles != null:
+		ambient_bubbles.global_position = cam.get_screen_center_position()
+		ambient_bubbles.emitting = depth > 120.0 and state != S.DEAD and state != S.WON
+
+	# fear: how close is the thing, plus short spikes (photo, charge, death)
+	var dist := creature.position.distance_to(sub.position)
+	var nearest := creature
+	for hunter in deep_creatures:
+		var hd := hunter.position.distance_to(sub.position)
+		if hd < dist:
+			dist = hd
+			nearest = hunter
+	var tgt := 0.0
+	if state == S.DIVING or state == S.ESCAPE:
+		tgt = clampf(1.0 - dist / 260.0, 0.0, 1.0)
+		if nearest.mode == Creature.M.LURK:
+			tgt *= 0.3
+	fear = lerpf(fear, maxf(tgt, fear_spike), 4.0 * delta)
+	fear_spike = move_toward(fear_spike, 0.0, 0.6 * delta)
+	if state == S.DEAD:
+		fear = 1.0
+
+	# flickering headlight
+	if state == S.DIVING or state == S.ESCAPE:
+		beam.energy = 1.15 + randf() * 0.1 + (randf() - 0.5) * fear * 0.8
+		if fear > 0.6 and randf() < 0.02:
+			beam.energy = 0.1
+
+	fx.set_shader_parameter("fear", fear)
+	fx.set_shader_parameter("murk", k_depth)
+	fx.set_shader_parameter("blackout", depth_blackout)
+
+
+func _update_ui(delta: float) -> void:
+	flash_a = move_toward(flash_a, 0.0, 2.5 * delta)
+	flash.color = Color(flash_col.r, flash_col.g, flash_col.b, flash_a)
+	hint_t -= delta
+	if hint_t <= 0.0:
+		hint.text = _default_hint()
+	if state == S.SHIP or state == S.BOARDING:
+		status.text = "M.V. HOLLOW TIDE  |  SUB RATING: MAX 2,000 m"
+	elif state == S.INTERIOR:
+		status.text = "PRESSURE CAPSULE  |  MAX DEPTH 2,000 m"
+	else:
+		status.text = "DEPTH %dm / 2,000m     PHOTOS %d/%d" % [int(sub.position.y), photos, PHOTOS_NEEDED]
+	photo_btn.disabled = photo_cd > 0.0 or view_inside
+	photo_btn.visible = (state == S.DIVING or state == S.ESCAPE) and not view_inside
+	view_toggle.visible = state == S.DIVING or state == S.ESCAPE
+	view_toggle.text = "VIEW: OUTSIDE" if view_inside else "VIEW: INSIDE"
+	sonar_t -= delta
+	if sonar_t <= 0.0:
+		sonar_t = 0.4
+		# Detail appears on the in-world green CRT, not as a top-right HUD readout.
+		var v := creature.position - sub.position
+		var d := v.length()
+		interior.contact_strength = 1.0 if d < 900.0 else 0.0
+		interior.depth = sub.position.y
+		interior.visible = (state == S.INTERIOR) or (view_inside and (state == S.DIVING or state == S.ESCAPE))
+		sonar.text = ""
+
+
+func _default_hint() -> String:
+	match state:
+		S.SHIP:
+			return "MISSION BRIEF: MAX DEPTH 2,000 m. Pressure beyond this rating will crush the sub. Tap to walk; board at the stern (left)."
+		S.INTERIOR:
+			return "Tap to walk to the controls on the right. You must start the dive yourself."
+		S.DIVING:
+			return "Tap/drag to steer. PHOTO the creatures. VIEW toggles the cramped red-lit cockpit; max rated depth is 2,000 m."
+		S.ESCAPE:
+			return "SWIM UP! Tap toward the surface."
+	return ""
+
+
+func _toggle_view() -> void:
+	view_inside = not view_inside
+	interior.visible = view_inside and (state == S.DIVING or state == S.ESCAPE)
+	interior.position = Vector2(sub_vp.size) * 0.5
+	interior.depth = sub.position.y
+	photo_btn.visible = not view_inside and (state == S.DIVING or state == S.ESCAPE)
+	view_toggle.text = "VIEW: OUTSIDE" if view_inside else "VIEW: INSIDE"
+
+
+func _say(text: String, dur: float = 4.0) -> void:
+	hint.text = text
+	hint_t = dur
+
+
+# ================================================================ PROCEDURAL AUDIO
+
+func _fill_audio(delta: float) -> void:
+	if gen_playback == null:
+		return
+	var n := gen_playback.get_frames_available()
+	if n <= 0:
+		return
+	var dt := 1.0 / MIX_RATE
+	var buf := PackedVector2Array()
+	buf.resize(n)
+	var deep := k_depth
+	var beat_period := 1.1 - fear * 0.6
+
+	# schedule a creepy one-shot (whale moan / hull creak / sonar ping)
+	event_t -= delta
+	if event_t <= 0.0 and event_age < 0.0:
+		event_age = 0.0
+		event_kind = randi() % 6
+		event_len = [4.0, 2.2, 2.6, 4.0, 2.8, 3.2][event_kind]
+		event_t = randf_range(7.0, 16.0) / (1.0 + fear)
+
+	for i in n:
+		var wn := randf() * 2.0 - 1.0
+		ph1 += TAU * 41.0 * dt
+		ph2 += TAU * 43.3 * dt
+		ph3 += TAU * 82.9 * dt
+		ph_lfo += TAU * 0.12 * dt
+		ph_wave += TAU * 0.3 * dt
+		if ph1 > TAU: ph1 -= TAU
+		if ph2 > TAU: ph2 -= TAU
+		if ph3 > TAU: ph3 -= TAU
+		if ph_lfo > TAU: ph_lfo -= TAU
+		if ph_wave > TAU: ph_wave -= TAU
+
+		# deep drone: two detuned sines beat against each other
+		var lfo := 0.65 + 0.35 * sin(ph_lfo)
+		var s := (sin(ph1) * 0.22 + sin(ph2) * 0.20) * lfo * (0.5 + 0.5 * deep)
+		s += sin(ph3) * 0.05 * (deep + fear)
+		# pressure rumble
+		lp += (wn - lp) * 0.015
+		s += lp * 1.6 * (0.25 + 0.3 * deep)
+		# surface wash of waves
+		wash_lp += (wn - wash_lp) * 0.08
+		var wv := 0.5 + 0.5 * sin(ph_wave)
+		s += wash_lp * wv * wv * 0.35 * (1.0 - deep)
+
+		# one-shot events
+		if event_age >= 0.0:
+			var u := event_age / event_len
+			var env := sin(PI * u)
+			var e := 0.0
+			if event_kind == 0:       # distant moan
+				var f := 220.0 - 110.0 * u + 6.0 * sin(event_age * 7.0)
+				ph_e += TAU * f * dt
+				e = (sin(ph_e) * 0.18 + sin(ph_e * 1.5) * 0.06) * env
+			elif event_kind == 1:     # hull creak
+				var f2 := 140.0 + 100.0 * absf(sin(event_age * 9.0))
+				ph_e += TAU * f2 * dt
+				e = signf(sin(ph_e)) * 0.05 * env * (0.6 + 0.4 * randf())
+			elif event_kind == 2:     # sonar ping + echo
+				ph_e += TAU * 880.0 * dt
+				e = sin(ph_e) * 0.12 * exp(-event_age * 4.0)
+				if event_age > 0.7:
+					e += sin(ph_e) * 0.05 * exp(-(event_age - 0.7) * 4.0)
+			elif event_kind == 3:     # pressure implosion: rising shriek then sub-bass crack
+				var f3 := 90.0 + 780.0 * minf(u * 1.8, 1.0)
+				ph_e += TAU * f3 * dt
+				e = sin(ph_e) * 0.32 * env + (randf() * 2.0 - 1.0) * 0.22 * exp(-event_age * 1.4)
+			elif event_kind == 4:     # creature throat groan
+				var f4 := 75.0 + 24.0 * sin(event_age * 2.0) - 20.0 * u
+				ph_e += TAU * f4 * dt
+				e = (sin(ph_e) * 0.22 + sin(ph_e * 0.53) * 0.12) * env
+			else:                     # clicking / chittering creature call
+				var f5 := 420.0 + 180.0 * sin(event_age * 17.0)
+				ph_e += TAU * f5 * dt
+				e = signf(sin(ph_e)) * 0.10 * env * (0.5 + 0.5 * sin(event_age * 31.0))
+			if ph_e > TAU: ph_e -= TAU
+			s += e * (0.4 + 0.6 * deep)
+			event_age += dt
+			if event_age > event_len:
+				event_age = -1.0
+
+		# heartbeat
+		heart_t += dt
+		if heart_t > beat_period:
+			heart_t -= beat_period
+		if fear > 0.08:
+			var b := sin(TAU * 52.0 * heart_t) * exp(-heart_t * 28.0)
+			if heart_t > 0.28:
+				b += 0.7 * sin(TAU * 46.0 * (heart_t - 0.28)) * exp(-(heart_t - 0.28) * 28.0)
+			s += b * 0.7 * fear
+
+		# jump-scare burst + camera click
+		if scare_env > 0.0:
+			s += (randf() * 2.0 - 1.0) * 0.6 * scare_env + sin(TAU * 95.0 * heart_t * 3.0) * 0.4 * scare_env
+			scare_env = maxf(scare_env - dt * 1.2, 0.0)
+		if click_env > 0.0:
+			s += (randf() * 2.0 - 1.0) * 0.5 * click_env
+			click_env = maxf(click_env - dt * 14.0, 0.0)
+
+		s = clampf(s, -1.0, 1.0)
+		buf[i] = Vector2(s, s)
+	gen_playback.push_buffer(buf)
+	 
